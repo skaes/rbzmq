@@ -63,6 +63,7 @@ typedef unsigned __int64 uint64_t;
     } while(0)
 
 VALUE socket_type;
+VALUE exception_type;
 
 /*
  * Document-class: ZMQ
@@ -124,7 +125,7 @@ static VALUE context_initialize (int argc_, VALUE* argv_, VALUE self_)
     assert (!DATA_PTR (self_));
     void *ctx = zmq_init (NIL_P (io_threads) ? 1 : NUM2INT (io_threads));
     if (!ctx) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
 
@@ -328,7 +329,7 @@ static VALUE internal_select(VALUE argval)
         rc = zmq_poll (ps.items, ps.nitems, arg->timeout_usec);
     
     if (rc == -1) {
-        rb_raise(rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise(exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
     else if (rc == 0)
@@ -429,7 +430,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
     Data_Get_Struct (self_, void, c);
     void * s = zmq_socket (c, NUM2INT (type_));
     if (!s) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
 
@@ -929,7 +930,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
                                  &optvalsize);
 
             if (rc != 0) {
-              rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+              rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
               return Qnil;
             }
 
@@ -948,7 +949,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
                                  &optvalsize);
 
             if (rc != 0) {
-              rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+              rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
               return Qnil;
             }
 
@@ -974,7 +975,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
                                  &optvalsize);
 
             if (rc != 0) {
-              rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+              rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
               return Qnil;
             }
 
@@ -1002,7 +1003,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
                                  &optvalsize);
 
             if (rc != 0) {
-              rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+              rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
               return Qnil;
             }
 
@@ -1021,7 +1022,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
                                  &optvalsize);
 
             if (rc != 0) {
-              rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+              rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
               return Qnil;
             }
 
@@ -1032,7 +1033,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
         }
         break;
     default:
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (EINVAL));
+        rb_raise (exception_type, "%s", zmq_strerror (EINVAL));
         return Qnil;
     }
   
@@ -1333,12 +1334,12 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
         break;
 
     default:
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (EINVAL));
+        rb_raise (exception_type, "%s", zmq_strerror (EINVAL));
         return Qnil;
     }
 
     if (rc != 0) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
 
@@ -1377,7 +1378,7 @@ static VALUE socket_bind (VALUE self_, VALUE addr_)
 
     int rc = zmq_bind (s, rb_string_value_cstr (&addr_));
     if (rc != 0) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
 
@@ -1420,7 +1421,7 @@ static VALUE socket_connect (VALUE self_, VALUE addr_)
 
     int rc = zmq_connect (s, rb_string_value_cstr (&addr_));
     if (rc != 0) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
 
@@ -1497,7 +1498,7 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     zmq_msg_t msg;
     int rc = zmq_msg_init_size (&msg, RSTRING_LEN (msg_));
     if (rc != 0) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
     memcpy (zmq_msg_data (&msg), RSTRING_PTR (msg_), RSTRING_LEN (msg_));
@@ -1521,7 +1522,7 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     }
 
     if (rc != 0) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
         return Qnil;
@@ -1606,7 +1607,7 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
     }
 
     if (rc != 0) {
-        rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
         return Qnil;
@@ -1637,7 +1638,7 @@ static VALUE socket_close (VALUE self_)
     if (s != NULL) {
         int rc = zmq_close (s);
         if (rc != 0) {
-            rb_raise (rb_eRuntimeError, "%s", zmq_strerror (zmq_errno ()));
+            rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
             return Qnil;
         }
 
@@ -1651,6 +1652,8 @@ void Init_zmq ()
     VALUE zmq_module = rb_define_module ("ZMQ");
     rb_define_singleton_method (zmq_module, "version", module_version, 0);
     rb_define_singleton_method (zmq_module, "select", module_select, -1);
+
+    exception_type = rb_define_class_under (zmq_module, "Error", rb_eRuntimeError );
 
     VALUE context_type = rb_define_class_under (zmq_module, "Context",
         rb_cObject);
