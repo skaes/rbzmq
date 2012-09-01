@@ -56,9 +56,19 @@ typedef unsigned __int64 uint64_t;
 #include <stdint.h>
 #endif
 
+struct zmq_context {
+    void *context;
+    unsigned refs;
+};
+
+struct zmq_socket {
+    void *socket;
+    struct zmq_context *context;
+};
+
 #define Check_Socket(__socket) \
     do {\
-        if ((__socket) == NULL)\
+        if ((__socket->socket) == NULL)\
             rb_raise (rb_eIOError, "closed socket");\
     } while(0)
 
@@ -92,17 +102,32 @@ static VALUE module_version (VALUE self_)
  * ZeroMQ library context.
  */
 
-static void context_free (void *ctx)
+static void context_free (void *ptr)
 {
-    if (ctx) {
-       int rc = zmq_term (ctx);
-       assert (rc == 0);
+    struct zmq_context * ctx = (struct zmq_context *)ptr;
+
+    assert(ctx->refs != 0);
+    ctx->refs--;
+
+    if (ctx->refs == 0) {
+        if (ctx->context != NULL) {
+            int rc = zmq_term(ctx->context);
+            assert (rc == 0);
+        }
+
+        xfree(ctx);
     }
 }
 
 static VALUE context_alloc (VALUE class_)
 {
-    return rb_data_object_alloc (class_, NULL, 0, context_free);
+    struct zmq_context * ctx;
+
+    ctx = ALLOC(struct zmq_context);
+    ctx->context = NULL;
+    ctx->refs = 1;
+
+    return rb_data_object_alloc (class_, ctx, 0, context_free);
 }
 
 /*
@@ -122,14 +147,17 @@ static VALUE context_initialize (int argc_, VALUE* argv_, VALUE self_)
     VALUE io_threads;
     rb_scan_args (argc_, argv_, "01", &io_threads);
 
-    assert (!DATA_PTR (self_));
-    void *ctx = zmq_init (NIL_P (io_threads) ? 1 : NUM2INT (io_threads));
-    if (!ctx) {
+    struct zmq_context * ctx = NULL;
+    Data_Get_Struct (self_, void, ctx);
+
+    assert (ctx->context == NULL);
+    void *zctx = zmq_init (NIL_P (io_threads) ? 1 : NUM2INT (io_threads));
+    if (!zctx) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
 
-    DATA_PTR (self_) = (void*) ctx;
+    ctx->context = zctx;
     return self_;
 }
 
@@ -159,14 +187,14 @@ static VALUE context_initialize (int argc_, VALUE* argv_, VALUE self_)
  */
 static VALUE context_close (VALUE self_)
 {
-    void * ctx = NULL;
+    struct zmq_context * ctx = NULL;
     Data_Get_Struct (self_, void, ctx);
     
-    if (ctx != NULL) {
-        int rc = zmq_term (ctx);
+    if (ctx->context != NULL) {
+        int rc = zmq_term(ctx->context);
         assert (rc == 0);
 
-        DATA_PTR (self_) = NULL;
+        ctx->context = NULL;
     }
 
     return Qnil;
@@ -222,7 +250,10 @@ static VALUE poll_add_item(VALUE io_, void *ps_) {
     item->events = state->event;
 
     if (CLASS_OF (io_) == socket_type) {
-        item->socket = DATA_PTR (io_);
+        struct zmq_socket *s;
+        Data_Get_Struct (io_, struct zmq_socket, s);
+      
+        item->socket = s->socket;
         item->fd = -1;
     }
     else {
@@ -364,14 +395,14 @@ static VALUE module_select_internal(VALUE readset, VALUE writeset, VALUE errset,
     nitems = (NIL_P (readset) ? 0 : RARRAY_LEN (readset)) +
              (NIL_P (writeset) ? 0 : RARRAY_LEN (writeset)) +
              (NIL_P (errset) ? 0 : RARRAY_LEN (errset));
-    arg.items = (zmq_pollitem_t*)ruby_xmalloc(sizeof(zmq_pollitem_t) * nitems);
+    arg.items = ALLOC_N(zmq_pollitem_t, nitems);
 
     arg.readset = readset;
     arg.writeset = writeset;
     arg.errset = errset;
     arg.timeout_usec = timeout_usec;
 
-    return rb_ensure(internal_select, (VALUE)&arg, (VALUE (*)())ruby_xfree, (VALUE)arg.items);
+    return rb_ensure(internal_select, (VALUE)&arg, (VALUE (*)())xfree, (VALUE)arg.items);
 }
 
 /*
@@ -399,12 +430,21 @@ static VALUE module_select (int argc_, VALUE* argv_, VALUE self_)
     return module_select_internal(readset, writeset, errset, timeout_usec);
 }
 
-static void socket_free (void *s)
+static void socket_free (void *ptr)
 {
-    if (s) {
-       int rc = zmq_close (s);
-       assert (rc == 0);
+    struct zmq_socket *s = (struct zmq_socket *)ptr;
+
+    if (s->socket != NULL) {
+        int rc = zmq_close(s->socket);
+        assert (rc == 0);
     }
+
+    if (s->context != NULL) {
+        /* Decrement the refcounter for the context (and possibly free it). */
+        context_free(s->context);
+    }
+
+    xfree(s);
 }
 
 /*
@@ -426,13 +466,28 @@ static void socket_free (void *s)
  */
 static VALUE context_socket (VALUE self_, VALUE type_)
 {
-    void * c = NULL;
-    Data_Get_Struct (self_, void, c);
-    void * s = zmq_socket (c, NUM2INT (type_));
-    if (!s) {
+    struct zmq_context * ctx = NULL;
+    void *socket;
+    struct zmq_socket *s;
+
+    Data_Get_Struct (self_, void, ctx);
+    
+    socket = zmq_socket(ctx->context, NUM2INT (type_));
+    if (!socket) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
+
+    s = ALLOC(struct zmq_socket);
+
+    /*
+     * Grab a reference on the context, to prevent it from being garbage-
+     * collected before the socket is closed.
+     */
+    s->context = ctx;
+    s->context->refs++;
+
+    s->socket = socket;
 
     return Data_Wrap_Struct(socket_type, 0, socket_free, s);
 }
@@ -905,14 +960,40 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Default value] N/A
  * [Applicable socket types] all
  *
+ * == ZMQ::SNDTIMEO
+ * Retrieves the timeout for send operations on the socket.
+ *
+ * If the value is 0, a send operation on the socket will return immediately, with a
+ * EAGAIN error if the message cannot be sent. If the value is -1, it will block until the
+ * message is sent. For all other values, it will try to send the message for that amount
+ * of time before returning with an EAGAIN error.
+ *
+ * [Option value type] Integer
+ * [Option value unit] milliseconds
+ * [Default value] -1 (infinite)
+ * [Applicable socket types] all
+ *
+ * == ZMQ::RCVTIMEO
+ * Retrieves the timeout for receive operations on the socket.
+ *
+ * If the value is 0, a receive operation on the socket will return immediately, with a
+ * EAGAIN error if there is no message to receive. If the value is -1, it will block until
+ * a message is available. For all other values, it will wait for a message for that
+ * amount of time before returning with an EAGAIN error.
+ *
+ * [Option value type] Integer
+ * [Option value unit] milliseconds
+ * [Default value] -1 (infinite)
+ * [Applicable socket types] all
+ *
  */
 static VALUE socket_getsockopt (VALUE self_, VALUE option_)
 {
     int rc = 0;
     VALUE retval;
-    void * s;
-    
-    Data_Get_Struct (self_, void, s);
+    struct zmq_socket * s;
+
+    Data_Get_Struct (self_, struct zmq_socket, s);
     Check_Socket (s);
   
     switch (NUM2INT (option_)) {
@@ -926,7 +1007,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
 #endif
             size_t optvalsize = sizeof(optval);
 
-            rc = zmq_getsockopt (s, NUM2INT (option_), (void *)&optval,
+            rc = zmq_getsockopt (s->socket, NUM2INT (option_), (void *)&optval,
                                  &optvalsize);
 
             if (rc != 0) {
@@ -945,7 +1026,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
             uint32_t optval;
             size_t optvalsize = sizeof(optval);
 
-            rc = zmq_getsockopt (s, NUM2INT (option_), (void *)&optval,
+            rc = zmq_getsockopt (s->socket, NUM2INT (option_), (void *)&optval,
                                  &optvalsize);
 
             if (rc != 0) {
@@ -967,11 +1048,15 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
 	case ZMQ_RECONNECT_IVL_MAX:
 	case ZMQ_RECOVERY_IVL_MSEC:
 #endif
+#if ZMQ_VERSION >= 20200
+        case ZMQ_SNDTIMEO:
+        case ZMQ_RCVTIMEO:
+#endif
         {
             int optval;
             size_t optvalsize = sizeof(optval);
 
-            rc = zmq_getsockopt (s, NUM2INT (option_), (void *)&optval,
+            rc = zmq_getsockopt (s->socket, NUM2INT (option_), (void *)&optval,
                                  &optvalsize);
 
             if (rc != 0) {
@@ -999,7 +1084,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
             int64_t optval;
             size_t optvalsize = sizeof(optval);
 
-            rc = zmq_getsockopt (s, NUM2INT (option_), (void *)&optval,
+            rc = zmq_getsockopt (s->socket, NUM2INT (option_), (void *)&optval,
                                  &optvalsize);
 
             if (rc != 0) {
@@ -1018,8 +1103,8 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
             char identity[255];
             size_t optvalsize = sizeof (identity);
 
-            rc = zmq_getsockopt (s, NUM2INT (option_), (void *)identity,
-                                 &optvalsize);
+            rc = zmq_getsockopt (s->socket, NUM2INT (option_),
+                                 (void *)identity, &optvalsize);
 
             if (rc != 0) {
               rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
@@ -1120,7 +1205,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
  * [Default value] nil
  * [Applicable socket types] all
  *
- * ZMQ::SUBSCRIBE: Establish message filter
+ * == ZMQ::SUBSCRIBE: Establish message filter
  * The ZMQ::SUBSCRIBE option shall establish a new message filter on a ZMQ::SUB
  * socket. Newly created ZMQ::SUB sockets shall filter out all incoming messages,
  * therefore you should call this option to establish an initial message filter.
@@ -1277,15 +1362,41 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
  * [Default value] 100
  * [Applicable socket types] all, only for connection-oriented transports
  *
+ * == ZMQ::SNDTIMEO
+ * Sets the timeout for send operations on the socket.
+ *
+ * If the value is 0, a send operation on the socket will return immediately, with a
+ * EAGAIN error if the message cannot be sent. If the value is -1, it will block until the
+ * message is sent. For all other values, it will try to send the message for that amount
+ * of time before returning with an EAGAIN error.
+ *
+ * [Option value type] Integer
+ * [Option value unit] milliseconds
+ * [Default value] -1 (infinite)
+ * [Applicable socket types] all
+ *
+ * == ZMQ::RCVTIMEO
+ * Sets the timeout for receive operations on the socket.
+ *
+ * If the value is 0, a receive operation on the socket will return immediately, with a
+ * EAGAIN error if there is no message to receive. If the value is -1, it will block until
+ * a message is available. For all other values, it will wait for a message for that
+ * amount of time before returning with an EAGAIN error.
+ *
+ * [Option value type] Integer
+ * [Option value unit] milliseconds
+ * [Default value] -1 (infinite)
+ * [Applicable socket types] all
+ *
  */
 static VALUE socket_setsockopt (VALUE self_, VALUE option_,
     VALUE optval_)
 {
 
     int rc = 0;
-    void * s;
+    struct zmq_socket * s;
 
-    Data_Get_Struct (self_, void, s);
+    Data_Get_Struct (self_, struct zmq_socket, s);
     Check_Socket (s);
 
     switch (NUM2INT (option_)) {
@@ -1301,7 +1412,7 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
 	        uint64_t optval = FIX2LONG (optval_);
 
 	        //  Forward the code to native 0MQ library.
-	        rc = zmq_setsockopt (s, NUM2INT (option_),
+	        rc = zmq_setsockopt (s->socket, NUM2INT (option_),
 	            (void*) &optval, sizeof (optval));
 	    }
 	    break;
@@ -1314,11 +1425,15 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
     case ZMQ_RECONNECT_IVL_MAX:
     case ZMQ_RECOVERY_IVL_MSEC:
 #endif
+#if ZMQ_VERSION >= 20200
+    case ZMQ_SNDTIMEO:
+    case ZMQ_RCVTIMEO:
+#endif
         {
             int optval = FIX2INT (optval_);
 
             //  Forward the code to native 0MQ library.
-            rc = zmq_setsockopt (s, NUM2INT (option_),
+            rc = zmq_setsockopt (s->socket, NUM2INT (option_),
                 (void*) &optval, sizeof (optval));
         }
         break;
@@ -1329,7 +1444,7 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
     case ZMQ_UNSUBSCRIBE:
 
         //  Forward the code to native 0MQ library.
-        rc = zmq_setsockopt (s, NUM2INT (option_),
+        rc = zmq_setsockopt (s->socket, NUM2INT (option_),
 	    (void *) StringValueCStr (optval_), RSTRING_LEN (optval_));
         break;
 
@@ -1372,11 +1487,11 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
  */
 static VALUE socket_bind (VALUE self_, VALUE addr_)
 {
-    void * s;
-    Data_Get_Struct (self_, void, s);
+    struct zmq_socket * s;
+    Data_Get_Struct (self_, struct zmq_socket, s);
     Check_Socket (s);
 
-    int rc = zmq_bind (s, rb_string_value_cstr (&addr_));
+    int rc = zmq_bind (s->socket, rb_string_value_cstr (&addr_));
     if (rc != 0) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
@@ -1415,11 +1530,11 @@ static VALUE socket_bind (VALUE self_, VALUE addr_)
  */
 static VALUE socket_connect (VALUE self_, VALUE addr_)
 {
-    void * s;
-    Data_Get_Struct (self_, void, s);
+    struct zmq_socket * s;
+    Data_Get_Struct (self_, struct zmq_socket, s);
     Check_Socket (s);
 
-    int rc = zmq_connect (s, rb_string_value_cstr (&addr_));
+    int rc = zmq_connect (s->socket, rb_string_value_cstr (&addr_));
     if (rc != 0) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
@@ -1487,8 +1602,8 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     
     rb_scan_args (argc_, argv_, "11", &msg_, &flags_);
 
-    void * s;
-    Data_Get_Struct (self_, void, s);
+    struct zmq_socket * s;
+    Data_Get_Struct (self_, struct zmq_socket, s);
     Check_Socket (s);
 
     Check_Type (msg_, T_STRING);
@@ -1496,17 +1611,18 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     int flags = NIL_P (flags_) ? 0 : NUM2INT (flags_);
 
     zmq_msg_t msg;
-    int rc = zmq_msg_init_size (&msg, RSTRING_LEN (msg_));
+    int msg_len = (int)RSTRING_LEN (msg_);
+    int rc = zmq_msg_init_size (&msg, msg_len);
     if (rc != 0) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
     }
-    memcpy (zmq_msg_data (&msg), RSTRING_PTR (msg_), RSTRING_LEN (msg_));
+    memcpy (zmq_msg_data (&msg), RSTRING_PTR (msg_), msg_len);
 
 #ifdef HAVE_RUBY_INTERN_H
     if (!(flags & ZMQ_NOBLOCK)) {
         struct zmq_send_recv_args send_args;
-        send_args.socket = s;
+        send_args.socket = s->socket;
         send_args.msg = &msg;
         send_args.flags = flags;
         rb_thread_blocking_region (zmq_send_blocking, (void*) &send_args, NULL, NULL);
@@ -1514,7 +1630,7 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     }
     else
 #endif
-        rc = zmq_send (s, &msg, flags);
+        rc = zmq_send (s->socket, &msg, flags);
     if (rc != 0 && zmq_errno () == EAGAIN) {
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
@@ -1577,8 +1693,8 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
     
     rb_scan_args (argc_, argv_, "01", &flags_);
 
-    void * s;
-    Data_Get_Struct (self_, void, s);
+    struct zmq_socket * s;
+    Data_Get_Struct (self_, struct zmq_socket, s);
     Check_Socket (s);
 
     int flags = NIL_P (flags_) ? 0 : NUM2INT (flags_);
@@ -1590,7 +1706,7 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
 #ifdef HAVE_RUBY_INTERN_H
     if (!(flags & ZMQ_NOBLOCK)) {
         struct zmq_send_recv_args recv_args;
-        recv_args.socket = s;
+        recv_args.socket = s->socket;
         recv_args.msg = &msg;
         recv_args.flags = flags;
         rb_thread_blocking_region (zmq_recv_blocking, (void*) &recv_args,
@@ -1599,7 +1715,7 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
     }
     else
 #endif
-        rc = zmq_recv (s, &msg, flags);
+        rc = zmq_recv (s->socket, &msg, flags);
     if (rc != 0 && zmq_errno () == EAGAIN) {
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
@@ -1633,16 +1749,20 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
  */
 static VALUE socket_close (VALUE self_)
 {
-    void * s = NULL;
-    Data_Get_Struct (self_, void, s);
-    if (s != NULL) {
-        int rc = zmq_close (s);
+    struct zmq_socket * s;
+    Data_Get_Struct (self_, struct zmq_socket, s);
+    if (s->socket != NULL) {
+        int rc = zmq_close(s->socket);
         if (rc != 0) {
             rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
             return Qnil;
         }
 
-        DATA_PTR (self_) = NULL;
+        s->socket = NULL;
+
+        /* Decrement the refcounter for the context (and possibly free it). */
+        context_free(s->context);
+        s->context = NULL;
     }
     return Qnil;
 }
@@ -1696,6 +1816,10 @@ void Init_zmq ()
 #if ZMQ_VERSION >= 20101
     rb_define_const (zmq_module, "RECONNECT_IVL_MAX", INT2NUM (ZMQ_RECONNECT_IVL_MAX));
     rb_define_const (zmq_module, "RECOVERY_IVL_MSEC", INT2NUM (ZMQ_RECOVERY_IVL_MSEC));
+#endif
+#if ZMQ_VERSION >= 20200
+    rb_define_const (zmq_module, "SNDTIMEO", INT2NUM (ZMQ_SNDTIMEO));
+    rb_define_const (zmq_module, "RCVTIMEO", INT2NUM (ZMQ_RCVTIMEO));
 #endif
 
     rb_define_const (zmq_module, "NOBLOCK", INT2NUM (ZMQ_NOBLOCK));
